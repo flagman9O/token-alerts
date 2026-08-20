@@ -1,0 +1,14 @@
+# База с находками и списком наблюдения
+alerts.db
+alerts.db-journal
+alerts.db-wal
+alerts.db-shm
+
+# Окружение и мусор
+.venv/
+__pycache__/
+*.pyc
+run.log
+
+# Файл службы, собранный под конкретную машину
+token-alerts.generated.service

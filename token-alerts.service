@@ -1,0 +1,27 @@
+[Unit]
+Description=Token alerts bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+Group=__USER__
+WorkingDirectory=__DIR__
+
+ExecStart=__DIR__/.venv/bin/python bot.py
+
+Restart=always
+RestartSec=5
+
+# Talks out to public APIs only; nothing listens on this machine.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+# Database lives here; keys are read-only under the home dir, which
+# ProtectHome already allows.
+ReadWritePaths=__DIR__
+
+[Install]
+WantedBy=multi-user.target
