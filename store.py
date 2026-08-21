@@ -116,14 +116,53 @@ def add_candidates(rows):
             [(m, s or "", n or "", src or "", now) for m, s, n, src in rows])
 
 
-def due_for_check(limit=600):
-    """Watchlist entries still inside the age window, oldest check first."""
-    max_age = get("max_age_h") * 3600
-    cutoff = int(time.time()) - int(max_age)
+def hot_list():
+    """Tokens already known to clear the market cap bar.
+
+    These are the only ones worth a detailed look every single minute — there
+    are a couple of hundred of them against tens of thousands on the list.
+    """
+    mc_min = get("mc_min")
     with db() as conn:
         return [dict(r) for r in conn.execute(
-            "SELECT * FROM watch WHERE first_seen >= ? "
-            "ORDER BY last_ts ASC LIMIT ?", (cutoff, limit))]
+            "SELECT * FROM watch WHERE mc >= ? ORDER BY last_ts ASC", (mc_min,))]
+
+
+def cold_batch(limit):
+    """Everything else, least recently screened first, newest breaking ties.
+
+    Fresh arrivals matter more than tokens that have been quiet for hours, so
+    among equally stale entries the younger one goes first.
+    """
+    mc_min = get("mc_min")
+    with db() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM watch WHERE mc < ? "
+            "ORDER BY last_ts ASC, first_seen DESC LIMIT ?", (mc_min, limit))]
+
+
+def record_screen(mint, mc):
+    """Cheap pass result. Keeping the cap for everyone is what lets us tell a
+    dead token from one we simply have not looked at yet."""
+    with db() as conn:
+        conn.execute("UPDATE watch SET last_ts=?, mc=?, checks=checks+1 "
+                     "WHERE mint=?", (int(time.time()), mc, mint))
+
+
+def drop_dead(min_checks=3, min_age_s=1800):
+    """Forget tokens that never got anywhere.
+
+    A token screened a few times, older than half an hour and still far below
+    the bar is not coming back — and keeping it starves the ones that matter.
+    """
+    mc_min = get("mc_min")
+    cutoff = int(time.time()) - min_age_s
+    with db() as conn:
+        cur = conn.execute(
+            "DELETE FROM watch WHERE checks >= ? AND first_seen < ? "
+            "AND mc < ? AND alerted_at = 0",
+            (min_checks, cutoff, mc_min * 0.5))
+        return cur.rowcount
 
 
 def record_check(mint, *, vol24, mc, liq, vol1m, fees_sol, pair_created=None):

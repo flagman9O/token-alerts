@@ -26,9 +26,11 @@ logging.basicConfig(level=logging.INFO,
                     datefmt="%H:%M:%S")
 log = logging.getLogger("bot")
 
-SCAN_EVERY = 60          # seconds between full passes over the watchlist
+SCAN_EVERY = 60          # seconds between passes
 GECKO_EVERY = 180        # new-pool sweep, kept rare to respect its limits
 BATCH = 30               # tokens per screening call
+REQ_BUDGET = 230         # requests per pass, against a limit of ~300/min
+HOT_CAP = 180            # detailed checks per pass; the rest wait one round
 
 
 # ---------- formatting ----------
@@ -81,7 +83,13 @@ def card(t, text=""):
 # ---------- scanning ----------
 
 async def scan_once(session, sol_usd):
-    """One pass: screen the watchlist cheaply, then look closely at survivors."""
+    """One pass, with the request budget spent where it matters.
+
+    Tokens already above the cap threshold get a detailed look every minute —
+    that is the only way per-minute volume means anything. Whatever budget is
+    left goes on screening the rest, which is mostly dead weight: of fifteen
+    thousand names on the list, about two hundred clear the bar.
+    """
     cfg = store.get_all()
     mc_min = float(cfg["mc_min"])
     vol_min = float(cfg["vol1m_min"])
@@ -89,35 +97,16 @@ async def scan_once(session, sol_usd):
     liq_min = float(cfg["liq_min"])
     max_age = float(cfg["max_age_h"])
 
-    rows = store.due_for_check()
-    if not rows:
-        return []
-    by_mint = {r["mint"]: r for r in rows}
-
-    # Stage one: market cap for everything, thirty at a time.
-    passed = []
-    for i in range(0, len(rows), BATCH):
-        chunk = [r["mint"] for r in rows[i:i + BATCH]]
-        info = await market.screen(session, chunk)
-        for mint in chunk:
-            got = info.get(mint)
-            if not got:
-                store.touch(mint)
-                continue
-            if got["mc"] >= mc_min:
-                passed.append((mint, got))
-            else:
-                store.touch(mint)
-
-    # Stage two: full picture across all pools, only for those worth it.
     hits = []
-    for mint, got in passed:
+    hot = store.hot_list()[:HOT_CAP]
+
+    for prev in hot:
+        mint = prev["mint"]
         det = await market.detail(session, mint)
         if not det:
             store.touch(mint)
             continue
 
-        prev = by_mint[mint]
         vol1m = market.per_minute_volume(prev["last_vol24"], prev["last_ts"],
                                          det["vol24"])
         fees = market.fees_sol(det["vol24"], sol_usd)
@@ -129,7 +118,7 @@ async def scan_once(session, sol_usd):
 
         if vol1m is None:
             continue          # first sighting: nothing to compare against yet
-        if age is not None and age > max_age:
+        if age is not None and max_age > 0 and age > max_age:
             continue
         if (det["mc"] >= mc_min and vol1m >= vol_min
                 and fees >= fees_min and det["liq"] >= liq_min):
@@ -139,6 +128,17 @@ async def scan_once(session, sol_usd):
                          "age_h": age,
                          "symbol": det["symbol"] or prev["symbol"],
                          "name": det["name"] or prev["name"]})
+
+    # Screening: whatever request budget the detailed pass did not use.
+    spare = max(0, REQ_BUDGET - len(hot))
+    cold = store.cold_batch(spare * BATCH)
+    for i in range(0, len(cold), BATCH):
+        chunk = [r["mint"] for r in cold[i:i + BATCH]]
+        info = await market.screen(session, chunk)
+        for mint in chunk:
+            got = info.get(mint)
+            store.record_screen(mint, got["mc"] if got else 0)
+
     return hits
 
 
@@ -169,7 +169,10 @@ async def scanner(session, stop):
             live = store.get("mode", str) == "live"
             for hit in await scan_once(session, sol):
                 await handle_hit(session, hit, live)
-            store.prune()
+            gone = store.prune() + store.drop_dead()
+            if gone:
+                log.info("выбыло из наблюдения: %s, осталось %s",
+                         gone, store.watch_size())
         except Exception as e:
             log.exception("сбой прохода: %s", e)
         await asyncio.sleep(max(5, SCAN_EVERY - (time.time() - started)))
