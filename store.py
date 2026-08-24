@@ -1,8 +1,17 @@
-"""SQLite state: the watchlist, volume snapshots, alert history and settings.
+"""SQLite state: per-network thresholds and the history of what was found.
 
-One file next to the code, same approach as the tracker. Every token we hear
-about goes on the watchlist and stays there for a day; each poll overwrites its
-last volume reading, which is what lets us derive per-minute volume.
+There is no watchlist any more. Market cap and per-minute volume are filtered
+by the API itself, so the bot no longer has to remember tens of thousands of
+tokens to work out which ones moved — it asks for the ones that already did.
+What is left to keep is the settings the owner changes from the chat or the
+`/settings` menu, and the alerts already sent, so the same token does not
+arrive twice in a row.
+
+Every threshold lives per chain (each network can be tuned, or turned off, on
+its own) except the handful that stay global: the watch/live mode, the
+re-alert window, and the liquidity floor — the owner never asked for those to
+differ by chain, and adding the option before it is wanted is just more menu
+to click through.
 """
 
 import sqlite3
@@ -12,17 +21,29 @@ from pathlib import Path
 
 DB = Path(__file__).parent / "alerts.db"
 
-# Thresholds the owner can change from the chat. Values are strings so that
-# one settings table can hold both numbers and switches.
-DEFAULTS = {
-    "mc_min": "200000",        # market cap, USD
-    "vol1m_min": "50000",      # volume over the last minute, USD, all pools
-    "fees_min": "25",          # lifetime fees, SOL, all pools
-    "liq_min": "0",            # liquidity floor, USD, off by default
-    "max_age_h": "24",         # only tokens younger than this
-    "mode": "watch",           # watch = collect quietly, live = send alerts
-    "realert_h": "6",          # do not repeat the same token more often
+CHAINS = ("sol", "bsc", "base", "robinhood", "eth")
+
+GLOBAL_DEFAULTS = {
+    "mode": "watch",       # watch = collect quietly, live = send alerts
+    "realert_h": "6",      # do not repeat the same token more often
+    "liq_min": "0",        # liquidity floor, USD, off by default, all chains
 }
+
+
+def chain_defaults(chain):
+    return {
+        # Base/RobinHood on by default alongside Solana and BSC, matching
+        # what the owner actually asked to be watched; Ethereum is available
+        # but off until asked for.
+        "enabled": "1" if chain in ("sol", "bsc", "base", "robinhood") else "0",
+        "mc_min": "200000",         # market cap, USD
+        "vol1m_min": "50000",       # volume over the last minute, USD
+        "fees_min": "2400",         # lifetime fees, USD — about 25 SOL
+        "fees_currency": "native",  # which unit /settings shows and accepts
+        "max_age_h": "0",           # token age cap in hours; 0 = no limit
+        "summary": "1",             # Groq + Twitter meme summary
+        "risk_filter": "0",         # skip high rug-risk / wash-traded tokens
+    }
 
 
 @contextmanager
@@ -38,190 +59,233 @@ def db():
 
 def init():
     with db() as conn:
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS watch (
-                mint        TEXT PRIMARY KEY,
-                symbol      TEXT DEFAULT '',
-                name        TEXT DEFAULT '',
-                source      TEXT DEFAULT '',
-                first_seen  INTEGER NOT NULL,
-                pair_created INTEGER DEFAULT 0,
-                last_ts     INTEGER DEFAULT 0,
-                last_vol24  REAL DEFAULT 0,
-                mc          REAL DEFAULT 0,
-                liq         REAL DEFAULT 0,
-                vol1m       REAL DEFAULT 0,
-                fees_sol    REAL DEFAULT 0,
-                alerted_at  INTEGER DEFAULT 0,
-                checks      INTEGER DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS watch_seen ON watch(first_seen);
-
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS alerts (
                 id       INTEGER PRIMARY KEY AUTOINCREMENT,
-                mint     TEXT NOT NULL,
+                chain    TEXT DEFAULT 'sol',
+                address  TEXT NOT NULL,
                 symbol   TEXT DEFAULT '',
                 name     TEXT DEFAULT '',
                 ts       INTEGER NOT NULL,
-                mc       REAL, vol1m REAL, fees_sol REAL, liq REAL,
+                mc       REAL, vol1m REAL, liq REAL,
+                fees_native REAL,
+                fees_usd    REAL,
                 age_h    REAL,
-                pools    INTEGER,
+                holders  INTEGER,
                 summary  TEXT DEFAULT '',
                 sent     INTEGER DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS alerts_ts ON alerts(ts);
+            )
+        """)
 
+        # The table predates multi-chain support (mint -> address, fees_sol ->
+        # fees_native, pools -> holders); top it up in place so old history
+        # survives the rewrite.
+        have = {r["name"] for r in conn.execute("PRAGMA table_info(alerts)")}
+        for col, decl in (("chain", "TEXT DEFAULT 'sol'"),
+                          ("address", "TEXT"),
+                          ("fees_native", "REAL"),
+                          ("fees_usd", "REAL"),
+                          ("holders", "INTEGER")):
+            if col not in have:
+                conn.execute(f"ALTER TABLE alerts ADD COLUMN {col} {decl}")
+        if "mint" in have:
+            conn.execute("UPDATE alerts SET address = mint "
+                         "WHERE address IS NULL AND mint IS NOT NULL")
+        if "fees_sol" in have:
+            conn.execute("UPDATE alerts SET fees_native = fees_sol "
+                         "WHERE fees_native IS NULL AND fees_sol IS NOT NULL")
+
+        # `mint` carries a NOT NULL from the very first schema, long before
+        # `address` existed, and SQLite cannot just drop that constraint —
+        # only a full rebuild does it. Data was already copied onto the new
+        # columns above, so this is a straight cutover.
+        if "mint" in have:
+            conn.execute("""
+                CREATE TABLE alerts_new (
+                    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chain    TEXT DEFAULT 'sol',
+                    address  TEXT NOT NULL,
+                    symbol   TEXT DEFAULT '',
+                    name     TEXT DEFAULT '',
+                    ts       INTEGER NOT NULL,
+                    mc       REAL, vol1m REAL, liq REAL,
+                    fees_native REAL,
+                    fees_usd    REAL,
+                    age_h    REAL,
+                    holders  INTEGER,
+                    summary  TEXT DEFAULT '',
+                    sent     INTEGER DEFAULT 0
+                )
+            """)
+            conn.execute("""
+                INSERT INTO alerts_new (id, chain, address, symbol, name, ts,
+                    mc, vol1m, liq, fees_native, fees_usd, age_h, holders,
+                    summary, sent)
+                SELECT id, chain, COALESCE(address, mint), symbol, name, ts,
+                    mc, vol1m, liq, fees_native, fees_usd, age_h, holders,
+                    summary, sent
+                FROM alerts WHERE COALESCE(address, mint) IS NOT NULL
+            """)
+            conn.execute("DROP TABLE alerts")
+            conn.execute("ALTER TABLE alerts_new RENAME TO alerts")
+
+        conn.execute("CREATE INDEX IF NOT EXISTS alerts_ts ON alerts(ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS alerts_token "
+                     "ON alerts(chain, address)")
+
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
-            );
+            )
         """)
-        for k, v in DEFAULTS.items():
+
+        def raw(key):
+            row = conn.execute("SELECT value FROM settings WHERE key = ?",
+                               (key,)).fetchone()
+            return row["value"] if row else None
+
+        def set_raw(key, value):
+            conn.execute("INSERT INTO settings (key, value) VALUES (?,?) "
+                         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                         (key, str(value)))
+
+        version = int(raw("schema_version") or "0")
+
+        # v0 -> v2: fees_min changed from SOL to USD when the official API
+        # replaced the homegrown formula — a stored "25" would silently mean
+        # $25 instead of 25 SOL, no filter at all. max_age_h=24 was a crutch
+        # for the old 24h-window fee estimate, obsolete now that fees cover a
+        # token's whole life.
+        if version < 2:
+            if conn.execute("SELECT 1 FROM settings LIMIT 1").fetchone():
+                if raw("fees_min") is not None:
+                    set_raw("fees_min", "2400")
+                if raw("max_age_h") is not None:
+                    set_raw("max_age_h", "0")
+            version = 2
+
+        # v2 -> v3: one shared set of thresholds becomes one set per chain,
+        # so each network can be tuned, or switched off, independently.
+        if version < 3:
+            old_mc = raw("mc_min") or "200000"
+            old_vol = raw("vol1m_min") or "50000"
+            old_fees = raw("fees_min") or "2400"
+            old_age = raw("max_age_h") or "0"
+            old_enabled = {c.strip() for c in
+                           (raw("chains") or "sol,bsc,base,robinhood").split(",")
+                           if c.strip()}
+            for chain in CHAINS:
+                set_raw(f"{chain}.enabled", "1" if chain in old_enabled else "0")
+                set_raw(f"{chain}.mc_min", old_mc)
+                set_raw(f"{chain}.vol1m_min", old_vol)
+                set_raw(f"{chain}.fees_min", old_fees)
+                set_raw(f"{chain}.fees_currency", "native")
+                set_raw(f"{chain}.max_age_h", old_age)
+                set_raw(f"{chain}.summary", "1")
+                set_raw(f"{chain}.risk_filter", "0")
+            for stale in ("mc_min", "vol1m_min", "fees_min", "max_age_h", "chains"):
+                conn.execute("DELETE FROM settings WHERE key = ?", (stale,))
+            version = 3
+
+        set_raw("schema_version", str(version))
+        for field, val in GLOBAL_DEFAULTS.items():
             conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?,?)",
-                         (k, v))
+                         (field, val))
+
+        # Left over from the polling-watchlist design; nothing reads it any more.
+        conn.execute("DROP TABLE IF EXISTS watch")
 
 
-# ---------- settings ----------
+# ---------- per-chain settings ----------
 
-def get_all():
-    with db() as conn:
-        return {r["key"]: r["value"]
-                for r in conn.execute("SELECT key, value FROM settings")}
-
-
-def get(key, cast=float):
+def get_chain(chain, field, cast=float):
     with db() as conn:
         row = conn.execute("SELECT value FROM settings WHERE key = ?",
-                           (key,)).fetchone()
-    val = row["value"] if row else DEFAULTS.get(key, "0")
+                           (f"{chain}.{field}",)).fetchone()
+    val = row["value"] if row else chain_defaults(chain)[field]
+    if cast is bool:
+        return val == "1"
     return val if cast is str else cast(val)
 
 
-def put(key, value):
+def put_chain(chain, field, value):
+    if isinstance(value, bool):
+        value = "1" if value else "0"
     with db() as conn:
         conn.execute("INSERT INTO settings (key, value) VALUES (?,?) "
                      "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                     (key, str(value)))
+                     (f"{chain}.{field}", str(value)))
 
 
-# ---------- watchlist ----------
+def toggle_chain(chain, field):
+    new = not get_chain(chain, field, bool)
+    put_chain(chain, field, new)
+    return new
 
-def add_candidates(rows):
-    """rows: iterable of (mint, symbol, name, source). Existing ones are kept."""
-    now = int(time.time())
+
+def chain_config(chain):
+    return {
+        "enabled": get_chain(chain, "enabled", bool),
+        "mc_min": get_chain(chain, "mc_min", float),
+        "vol1m_min": get_chain(chain, "vol1m_min", float),
+        "fees_min": get_chain(chain, "fees_min", float),
+        "fees_currency": get_chain(chain, "fees_currency", str),
+        "max_age_h": get_chain(chain, "max_age_h", float),
+        "summary": get_chain(chain, "summary", bool),
+        "risk_filter": get_chain(chain, "risk_filter", bool),
+    }
+
+
+def enabled_chains():
+    return [c for c in CHAINS if get_chain(c, "enabled", bool)]
+
+
+# ---------- global settings ----------
+
+def get_global(field, cast=float):
     with db() as conn:
-        conn.executemany(
-            "INSERT OR IGNORE INTO watch (mint, symbol, name, source, first_seen)"
-            " VALUES (?,?,?,?,?)",
-            [(m, s or "", n or "", src or "", now) for m, s, n, src in rows])
+        row = conn.execute("SELECT value FROM settings WHERE key = ?",
+                           (field,)).fetchone()
+    val = row["value"] if row else GLOBAL_DEFAULTS[field]
+    return val if cast is str else cast(val)
 
 
-def hot_list():
-    """Tokens already known to clear the market cap bar.
-
-    These are the only ones worth a detailed look every single minute — there
-    are a couple of hundred of them against tens of thousands on the list.
-    """
-    mc_min = get("mc_min")
+def put_global(field, value):
     with db() as conn:
-        return [dict(r) for r in conn.execute(
-            "SELECT * FROM watch WHERE mc >= ? ORDER BY last_ts ASC", (mc_min,))]
+        conn.execute("INSERT INTO settings (key, value) VALUES (?,?) "
+                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                     (field, str(value)))
 
 
-def cold_batch(limit):
-    """Everything else, least recently screened first, newest breaking ties.
-
-    Fresh arrivals matter more than tokens that have been quiet for hours, so
-    among equally stale entries the younger one goes first.
-    """
-    mc_min = get("mc_min")
-    with db() as conn:
-        return [dict(r) for r in conn.execute(
-            "SELECT * FROM watch WHERE mc < ? "
-            "ORDER BY last_ts ASC, first_seen DESC LIMIT ?", (mc_min, limit))]
-
-
-def record_screen(mint, mc):
-    """Cheap pass result. Keeping the cap for everyone is what lets us tell a
-    dead token from one we simply have not looked at yet."""
-    with db() as conn:
-        conn.execute("UPDATE watch SET last_ts=?, mc=?, checks=checks+1 "
-                     "WHERE mint=?", (int(time.time()), mc, mint))
-
-
-def drop_dead(min_checks=3, min_age_s=1800):
-    """Forget tokens that never got anywhere.
-
-    A token screened a few times, older than half an hour and still far below
-    the bar is not coming back — and keeping it starves the ones that matter.
-    """
-    mc_min = get("mc_min")
-    cutoff = int(time.time()) - min_age_s
-    with db() as conn:
-        cur = conn.execute(
-            "DELETE FROM watch WHERE checks >= ? AND first_seen < ? "
-            "AND mc < ? AND alerted_at = 0",
-            (min_checks, cutoff, mc_min * 0.5))
-        return cur.rowcount
-
-
-def record_check(mint, *, vol24, mc, liq, vol1m, fees_sol, pair_created=None):
-    now = int(time.time())
-    with db() as conn:
-        if pair_created is None:
-            conn.execute(
-                "UPDATE watch SET last_ts=?, last_vol24=?, mc=?, liq=?, vol1m=?,"
-                " fees_sol=?, checks=checks+1 WHERE mint=?",
-                (now, vol24, mc, liq, vol1m, fees_sol, mint))
-        else:
-            conn.execute(
-                "UPDATE watch SET last_ts=?, last_vol24=?, mc=?, liq=?, vol1m=?,"
-                " fees_sol=?, checks=checks+1, pair_created=? WHERE mint=?",
-                (now, vol24, mc, liq, vol1m, fees_sol, pair_created, mint))
-
-
-def touch(mint):
-    """Mark as checked without new numbers, so it moves to the back of the queue."""
-    with db() as conn:
-        conn.execute("UPDATE watch SET last_ts=?, checks=checks+1 WHERE mint=?",
-                     (int(time.time()), mint))
-
-
-def prune():
-    """Drop entries past the age window. Returns how many went."""
-    cutoff = int(time.time()) - int(get("max_age_h") * 3600)
-    with db() as conn:
-        cur = conn.execute("DELETE FROM watch WHERE first_seen < ?", (cutoff,))
-        return cur.rowcount
-
-
-def watch_size():
-    with db() as conn:
-        return conn.execute("SELECT COUNT(*) c FROM watch").fetchone()["c"]
+def toggle_mode():
+    new = "watch" if get_global("mode", str) == "live" else "live"
+    put_global("mode", new)
+    return new
 
 
 # ---------- alerts ----------
 
-def recently_alerted(mint):
-    window = get("realert_h") * 3600
+def recently_alerted(chain, address):
+    window = get_global("realert_h") * 3600
+    cutoff = time.time() - window
     with db() as conn:
-        row = conn.execute("SELECT alerted_at FROM watch WHERE mint = ?",
-                           (mint,)).fetchone()
-    return bool(row and row["alerted_at"] and
-                time.time() - row["alerted_at"] < window)
+        row = conn.execute(
+            "SELECT 1 FROM alerts WHERE chain = ? AND address = ? AND ts > ? "
+            "LIMIT 1", (chain, address, cutoff)).fetchone()
+    return row is not None
 
 
 def save_alert(t, summary="", sent=0):
-    now = int(time.time())
     with db() as conn:
         conn.execute(
-            "INSERT INTO alerts (mint, symbol, name, ts, mc, vol1m, fees_sol,"
-            " liq, age_h, pools, summary, sent) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (t["mint"], t.get("symbol", ""), t.get("name", ""), now,
-             t.get("mc"), t.get("vol1m"), t.get("fees_sol"), t.get("liq"),
-             t.get("age_h"), t.get("pools"), summary, sent))
-        conn.execute("UPDATE watch SET alerted_at = ? WHERE mint = ?",
-                     (now, t["mint"]))
+            "INSERT INTO alerts (chain, address, symbol, name, ts, mc, vol1m,"
+            " liq, fees_native, fees_usd, age_h, holders, summary, sent)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (t.get("chain", "sol"), t["address"], t.get("symbol", ""),
+             t.get("name", ""), int(time.time()), t.get("mc"), t.get("vol1m"),
+             t.get("liq"), t.get("fees_native"), t.get("fees_usd"),
+             t.get("age_h"), t.get("holders"), summary, sent))
 
 
 def alerts_since(ts):

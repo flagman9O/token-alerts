@@ -1,8 +1,14 @@
 """Token alert bot.
 
-Watches Solana tokens and pings Telegram when one crosses every threshold at
-once: market cap, volume over the last minute, and lifetime fees — all summed
-across every pool the token trades in, the way gmgn counts them.
+Watches several chains through the official GMGN API and pings Telegram when a
+token crosses every threshold at once: market cap, volume over the last minute
+and lifetime fees — all counted across every pool, the way gmgn counts them.
+Every threshold is per chain (see store.py), configurable from the chat
+either as a menu (/settings) or as text commands.
+
+The first two thresholds are applied by the API itself, so a pass costs one
+request per chain. Only the survivors of that filter — usually none, sometimes
+a handful — are looked up individually to check their fees.
 
 Runs two modes. In "watch" it stays quiet and collects, sending one digest a
 day, which is how thresholds get calibrated on real data. In "live" it sends
@@ -15,8 +21,9 @@ import time
 
 import aiohttp
 
-import market
-import sources
+import fmt
+import gmgn
+import menu
 import store
 import summary
 import telegram as tg
@@ -26,165 +33,192 @@ logging.basicConfig(level=logging.INFO,
                     datefmt="%H:%M:%S")
 log = logging.getLogger("bot")
 
-SCAN_EVERY = 60          # seconds between passes
-GECKO_EVERY = 180        # new-pool sweep, kept rare to respect its limits
-BATCH = 30               # tokens per screening call
-REQ_BUDGET = 230         # requests per pass, against a limit of ~300/min
-HOT_CAP = 180            # detailed checks per pass; the rest wait one round
+SCAN_EVERY = 30          # seconds between passes
+
+# Bubblemaps has its own chain slugs and does not cover every network.
+BUBBLE = {"sol": "solana", "bsc": "bsc", "base": "base", "eth": "eth"}
 
 
 # ---------- formatting ----------
 
-def money(v):
-    if v is None:
-        return "—"
-    v = float(v)
-    if v >= 1_000_000:
-        return f"${v/1_000_000:.2f}M"
-    if v >= 1_000:
-        return f"${v/1_000:.1f}K"
-    return f"${v:.0f}"
-
-
-def links(mint):
-    return (f'<a href="https://gmgn.ai/sol/token/{mint}">gmgn</a> · '
-            f'<a href="https://v2.bubblemaps.io/map?address={mint}&chain=solana">bubblemaps</a> · '
-            f'<a href="https://dexscreener.com/solana/{mint}">dexscreener</a>')
+def links(chain, address):
+    out = [f'<a href="https://gmgn.ai/{chain}/token/{address}">gmgn</a>']
+    slug = BUBBLE.get(chain)
+    if slug:
+        out.append(f'<a href="https://v2.bubblemaps.io/map?address={address}'
+                   f'&chain={slug}">bubblemaps</a>')
+    return " · ".join(out)
 
 
 def card(t, text=""):
     age = t.get("age_h")
-    age_s = "—" if age is None else (f"{age:.0f} ч" if age >= 1 else f"{age*60:.0f} мин")
+    if age is None:
+        age_s = "—"
+    elif age >= 24:
+        age_s = f"{age/24:.0f} дн"
+    elif age >= 1:
+        age_s = f"{age:.0f} ч"
+    else:
+        age_s = f"{age*60:.0f} мин"
+
     head = f"🔥 <b>{t.get('symbol') or '?'}</b>"
     if t.get("name") and t["name"] != t.get("symbol"):
         head += f" · {t['name'][:40]}"
+    head += f"  <i>{gmgn.CHAIN_NAMES.get(t['chain'], t['chain'])}</i>"
 
+    coin = gmgn.NATIVE.get(t["chain"], "")
     body = [
         head, "",
-        f"Капитализация   <b>{money(t.get('mc'))}</b>",
-        f"Объём за 1 мин  <b>{money(t.get('vol1m'))}</b>",
-        f"Комиссии всего  <b>{t.get('fees_sol', 0):,.0f} SOL</b> ({t.get('pools', 0)} пулов)",
-        f"Ликвидность     {money(t.get('liq'))}",
+        f"Капитализация   <b>{fmt.money(t.get('mc'))}</b>",
+        f"Объём за 1 мин  <b>{fmt.money(t.get('vol1m'))}</b>",
+        f"Комиссии всего  <b>{t.get('fees_native', 0):,.1f} {coin}</b>"
+        f" ({fmt.money(t.get('fees_usd'))})",
+        f"Ликвидность     {fmt.money(t.get('liq'))}",
         f"Возраст         {age_s}",
     ]
+    if t.get("holders"):
+        body.append(f"Держателей      {t['holders']:,}")
+
+    flags = []
+    if t.get("smart"):
+        flags.append(f"смарт-мани {t['smart']}")
+    if t.get("renowned"):
+        flags.append(f"KOL {t['renowned']}")
+    if t.get("rug_ratio", 0) > 0.3:
+        flags.append(f"⚠️ риск рага {t['rug_ratio']:.0%}")
+    if t.get("wash"):
+        flags.append("⚠️ накрутка объёма")
+    if t.get("bundler", 0) > 0.3:
+        flags.append(f"⚠️ бандлеры {t['bundler']:.0%}")
+    if t.get("top10", 0) > 0.5:
+        flags.append(f"⚠️ топ-10 держат {t['top10']:.0%}")
+    if flags:
+        body += ["", " · ".join(flags)]
+
     if text:
         body += ["", f"<i>{text}</i>"]
-    meta = t.get("meta") or {}
+
     extra = []
-    if meta.get("twitter"):
-        extra.append(f'<a href="{meta["twitter"]}">twitter</a>')
-    if meta.get("website"):
-        extra.append(f'<a href="{meta["website"]}">сайт</a>')
-    body += ["", links(t["mint"]) + ("" if not extra else " · " + " · ".join(extra))]
-    body += [f"<code>{t['mint']}</code>"]
+    tw = gmgn.twitter_url(t.get("twitter"))
+    if tw:
+        extra.append(f'<a href="{tw}">twitter</a>')
+    if t.get("telegram"):
+        extra.append(f'<a href="{t["telegram"]}">telegram</a>')
+    if t.get("website"):
+        extra.append(f'<a href="{t["website"]}">сайт</a>')
+    body += ["", links(t["chain"], t["address"]) +
+             ("" if not extra else " · " + " · ".join(extra))]
+    body += [f"<code>{t['address']}</code>"]
     return "\n".join(body)
 
 
 # ---------- scanning ----------
 
-async def scan_once(session, sol_usd):
-    """One pass, with the request budget spent where it matters.
+async def scan_chain(session, chain, cfg, prices):
+    """One request for the shortlist, then one per candidate for its fees.
 
-    Tokens already above the cap threshold get a detailed look every minute —
-    that is the only way per-minute volume means anything. Whatever budget is
-    left goes on screening the rest, which is mostly dead weight: of fifteen
-    thousand names on the list, about two hundred clear the bar.
+    `cfg` is a chain's settings from `store.chain_config` — the caller
+    decides whether the chain is enabled; this function will happily scan a
+    disabled one too, since that is exactly what "проверить сейчас" needs to
+    preview a chain before switching it on.
     """
-    cfg = store.get_all()
-    mc_min = float(cfg["mc_min"])
-    vol_min = float(cfg["vol1m_min"])
-    fees_min = float(cfg["fees_min"])
-    liq_min = float(cfg["liq_min"])
-    max_age = float(cfg["max_age_h"])
-
+    rows = await gmgn.rank(session, chain,
+                           mc_min=cfg["mc_min"], vol_min=cfg["vol1m_min"])
+    liq_min = store.get_global("liq_min")
     hits = []
-    hot = store.hot_list()[:HOT_CAP]
-
-    for prev in hot:
-        mint = prev["mint"]
-        det = await market.detail(session, mint)
-        if not det:
-            store.touch(mint)
+    for t in rows:
+        age = gmgn.age_hours(t["created"])
+        if cfg["max_age_h"] > 0 and age is not None and age > cfg["max_age_h"]:
+            continue
+        if t["liq"] < liq_min:
+            continue
+        if cfg["risk_filter"] and (t["rug_ratio"] > 0.3 or t["wash"]
+                                   or t["bundler"] > 0.3):
+            continue
+        if store.recently_alerted(chain, t["address"]):
             continue
 
-        vol1m = market.per_minute_volume(prev["last_vol24"], prev["last_ts"],
-                                         det["vol24"])
-        fees = market.fees_sol(det["vol24"], sol_usd)
-        age = market.age_hours(det["pair_created"])
-
-        store.record_check(mint, vol24=det["vol24"], mc=det["mc"],
-                           liq=det["liq"], vol1m=vol1m or 0, fees_sol=fees,
-                           pair_created=det["pair_created"])
-
-        if vol1m is None:
-            continue          # first sighting: nothing to compare against yet
-        if age is not None and max_age > 0 and age > max_age:
+        info = await gmgn.token_info(session, chain, t["address"])
+        if not info:
             continue
-        if (det["mc"] >= mc_min and vol1m >= vol_min
-                and fees >= fees_min and det["liq"] >= liq_min):
-            if store.recently_alerted(mint):
-                continue
-            hits.append({**det, "vol1m": vol1m, "fees_sol": fees,
-                         "age_h": age,
-                         "symbol": det["symbol"] or prev["symbol"],
-                         "name": det["name"] or prev["name"]})
+        fees_usd = gmgn.fees_usd(chain, info["total_fee"], prices)
+        if fees_usd < cfg["fees_min"]:
+            continue
 
-    # Screening: whatever request budget the detailed pass did not use.
-    spare = max(0, REQ_BUDGET - len(hot))
-    cold = store.cold_batch(spare * BATCH)
-    for i in range(0, len(cold), BATCH):
-        chunk = [r["mint"] for r in cold[i:i + BATCH]]
-        info = await market.screen(session, chunk)
-        for mint in chunk:
-            got = info.get(mint)
-            store.record_screen(mint, got["mc"] if got else 0)
-
+        hits.append({**t,
+                     "age_h": age,
+                     "fees_native": info["total_fee"],
+                     "fees_usd": fees_usd,
+                     "summary_enabled": cfg["summary"],
+                     "symbol": t["symbol"] or info["symbol"],
+                     "name": t["name"] or info["name"],
+                     "twitter": t["twitter"] or info["twitter"],
+                     "telegram": t["telegram"] or info["telegram"],
+                     "website": t["website"] or info["website"],
+                     "description": info["description"]})
     return hits
 
 
 async def handle_hit(session, hit, live):
-    meta = await summary.token_meta(session, hit["mint"])
-    hit["meta"] = meta
-    text = await summary.describe(session, hit.get("name"), hit.get("symbol"), meta)
+    text = ""
+    if hit.get("summary_enabled", True):
+        text = await summary.describe(session, hit.get("name"), hit.get("symbol"),
+                                      hit.get("description", ""),
+                                      gmgn.twitter_url(hit.get("twitter")))
     sent = 0
     if live:
         sent = 1 if await tg.send(session, card(hit, text)) else 0
     store.save_alert(hit, summary=text, sent=sent)
-    log.info("находка: %s mc=%.0f vol1m=%.0f fees=%.0f%s",
-             hit.get("symbol"), hit.get("mc"), hit.get("vol1m"),
-             hit.get("fees_sol"), "" if live else " (тихий режим)")
+    log.info("находка: %s/%s mc=%.0f vol1m=%.0f комиссии=$%.0f%s",
+             hit["chain"], hit.get("symbol"), hit.get("mc"), hit.get("vol1m"),
+             hit.get("fees_usd"), "" if live else " (тихий режим)")
+
+
+async def manual_scan(session, chain):
+    """"Проверить сейчас" — runs once, on demand, ignoring watch/live: the
+    owner asked to see the result right now, not to wait for a digest."""
+    cfg = store.chain_config(chain)
+    prices = await gmgn.cached_native_prices(session)
+    hits = await scan_chain(session, chain, cfg, prices)
+    if not hits:
+        await tg.send(session, f"🔍 {gmgn.CHAIN_NAMES[chain]}: пока никто не "
+                      "подходит под текущие пороги.")
+        return
+    for hit in hits:
+        await handle_hit(session, hit, live=True)
 
 
 # ---------- loops ----------
 
 async def scanner(session, stop):
-    sol = await market.sol_price(session) or 0
-    last_price = time.time()
     while not stop.is_set():
         started = time.time()
         try:
-            if time.time() - last_price > 300:
-                sol = await market.sol_price(session) or sol
-                last_price = time.time()
-            live = store.get("mode", str) == "live"
-            for hit in await scan_once(session, sol):
-                await handle_hit(session, hit, live)
-            gone = store.prune() + store.drop_dead()
-            if gone:
-                log.info("выбыло из наблюдения: %s, осталось %s",
-                         gone, store.watch_size())
+            prices = await gmgn.cached_native_prices(session)
+            live = store.get_global("mode", str) == "live"
+            for chain in store.enabled_chains():
+                cfg = store.chain_config(chain)
+                for hit in await scan_chain(session, chain, cfg, prices):
+                    await handle_hit(session, hit, live)
         except Exception as e:
             log.exception("сбой прохода: %s", e)
         await asyncio.sleep(max(5, SCAN_EVERY - (time.time() - started)))
 
 
-async def gecko_loop(session, stop):
-    while not stop.is_set():
-        try:
-            await sources.gecko_new_pools(session)
-        except Exception as e:
-            log.warning("gecko: %s", type(e).__name__)
-        await asyncio.sleep(GECKO_EVERY)
+async def handle_button(session, data, chat_id, message_id, cq_id):
+    try:
+        if data.startswith("scan:"):
+            chain = data.split(":", 1)[1]
+            await manual_scan(session, chain)
+            text, kb = await menu.chain_screen(session, chain)
+        else:
+            text, kb = await menu.handle_callback(session, data, chat_id, message_id)
+        await tg.edit_message(session, chat_id, message_id, text, kb)
+        await tg.answer_callback(session, cq_id)
+    except Exception as e:
+        log.exception("меню: %s", e)
+        await tg.answer_callback(session, cq_id, "Ошибка, попробуйте ещё раз",
+                                 show_alert=True)
 
 
 async def commands(session, stop):
@@ -192,9 +226,21 @@ async def commands(session, stop):
     while not stop.is_set():
         ups, offset = await tg.get_updates(session, offset)
         for u in ups:
+            cq = tg.callback_query(u)
+            if cq:
+                cq_id, data, chat_id, message_id = cq
+                await handle_button(session, data, chat_id, message_id, cq_id)
+                continue
             text = tg.message_text(u)
-            if text:
-                await reply(session, text)
+            if not text:
+                continue
+            if menu.PENDING and await menu.handle_pending_text(session, text):
+                continue
+            await reply(session, text)
+
+
+CHAIN_FIELDS = {"mc_min", "vol1m_min", "fees_min", "max_age_h"}
+GLOBAL_FIELDS = {"realert_h", "liq_min"}
 
 
 async def reply(session, text):
@@ -204,41 +250,81 @@ async def reply(session, text):
     if cmd in ("start", "help"):
         await tg.send(session,
             "Сканер токенов на связи.\n\n"
+            "/settings — меню настроек по сетям\n"
             "/status — пороги и статистика\n"
-            "/set ключ значение — сменить порог\n"
+            "/set ключ значение — сменить порог текстом\n"
+            "/chains — какие сети включены; /chains sol off — выключить\n"
             "/mode watch|live — тихий режим или алерты\n"
             "/last — последние находки\n\n"
-            "Ключи: mc_min, vol1m_min, fees_min, liq_min, max_age_h, realert_h")
+            "В /set ключ — либо общий (realert_h, liq_min), либо сетевой "
+            "вида sol.mc_min. Комиссии через /set — только в долларах, "
+            "валюту ввода меняйте в /settings.")
+
+    elif cmd == "settings":
+        text0, kb0 = menu.root_screen()
+        await tg.send(session, text0, reply_markup=kb0)
 
     elif cmd == "status":
-        cfg = store.get_all()
+        mode = store.get_global("mode", str)
         day = store.alerts_since(int(time.time()) - 86400)
-        await tg.send(session,
-            f"<b>Режим:</b> {cfg['mode']}\n"
-            f"<b>Под наблюдением:</b> {store.watch_size()} токенов\n"
-            f"<b>Находок за сутки:</b> {len(day)}\n\n"
-            f"Капитализация ≥ {money(float(cfg['mc_min']))}\n"
-            f"Объём за 1 мин ≥ {money(float(cfg['vol1m_min']))}\n"
-            f"Комиссии ≥ {cfg['fees_min']} SOL\n"
-            f"Ликвидность ≥ {money(float(cfg['liq_min']))}\n"
-            f"Возраст ≤ {cfg['max_age_h']} ч\n"
-            f"Повтор не чаще {cfg['realert_h']} ч")
+        lines = [
+            f"<b>Режим:</b> {mode}",
+            f"<b>Находок за сутки:</b> {len(day)}",
+            f"<b>Ликвидность (все сети) ≥</b> {fmt.money(store.get_global('liq_min'))}",
+            f"<b>Повтор алерта:</b> не чаще {store.get_global('realert_h'):.0f} ч",
+            "",
+        ]
+        for chain in store.CHAINS:
+            c = store.chain_config(chain)
+            mark = "🟢" if c["enabled"] else "⛔"
+            lines.append(
+                f"{mark} <b>{gmgn.CHAIN_NAMES[chain]}</b>: "
+                f"капа≥{fmt.money(c['mc_min'])} · "
+                f"объём/мин≥{fmt.money(c['vol1m_min'])} · "
+                f"комиссии≥{fmt.money(c['fees_min'])} · "
+                f"возраст≤{fmt.hours(c['max_age_h'])}")
+        await tg.send(session, "\n".join(lines))
 
     elif cmd == "set" and len(parts) == 3:
         key, val = parts[1], parts[2]
-        if key not in store.DEFAULTS:
-            await tg.send(session, f"Не знаю ключ {key}")
-            return
         try:
-            float(val)
+            num = float(val)
         except ValueError:
             await tg.send(session, "Значение должно быть числом")
             return
-        store.put(key, val)
-        await tg.send(session, f"{key} = {val}")
+        if "." in key:
+            chain, field = key.split(".", 1)
+            if chain not in store.CHAINS or field not in CHAIN_FIELDS:
+                await tg.send(session, f"Не знаю ключ {key}. Сети: "
+                              + ", ".join(store.CHAINS))
+                return
+            store.put_chain(chain, field, num)
+            await tg.send(session, f"{key} = {val}")
+        elif key in GLOBAL_FIELDS:
+            store.put_global(key, num)
+            await tg.send(session, f"{key} = {val}")
+        else:
+            await tg.send(session, f"Не знаю ключ {key}. Общие: "
+                          + ", ".join(GLOBAL_FIELDS) +
+                          ". Сетевые — вида sol.mc_min: " +
+                          ", ".join(CHAIN_FIELDS))
+
+    elif cmd == "chains" and len(parts) == 1:
+        lines = [f"{'🟢' if store.get_chain(c, 'enabled', bool) else '⛔'} {c}"
+                 for c in store.CHAINS]
+        await tg.send(session, "<b>Сети</b>\n" + "\n".join(lines))
+
+    elif cmd == "chains" and len(parts) == 3 and parts[2] in ("on", "off"):
+        chain = parts[1].lower()
+        if chain not in store.CHAINS:
+            await tg.send(session, "Не знаю сеть. Доступно: "
+                          + ", ".join(store.CHAINS))
+            return
+        store.put_chain(chain, "enabled", parts[2] == "on")
+        await tg.send(session, f"{chain}: {'включено' if parts[2] == 'on' else 'выключено'}")
 
     elif cmd == "mode" and len(parts) == 2 and parts[1] in ("watch", "live"):
-        store.put("mode", parts[1])
+        store.put_global("mode", parts[1])
         await tg.send(session, "Режим: " + parts[1] +
                       (" — присылаю находки сразу" if parts[1] == "live"
                        else " — коплю тихо, сводка раз в сутки"))
@@ -248,8 +334,8 @@ async def reply(session, text):
         if not rows:
             await tg.send(session, "За сутки находок не было")
             return
-        lines = [f"{r['symbol'] or '?'} · {money(r['mc'])} · "
-                 f"объём {money(r['vol1m'])} · {r['fees_sol']:,.0f} SOL"
+        lines = [f"{r['symbol'] or '?'} ({r['chain']}) · {fmt.money(r['mc'])} · "
+                 f"объём {fmt.money(r['vol1m'])} · комиссии {fmt.money(r['fees_usd'])}"
                  for r in rows]
         await tg.send(session, "<b>Находки за сутки</b>\n" + "\n".join(lines))
 
@@ -261,7 +347,7 @@ async def digest(session, stop):
     """One summary a day while in watch mode."""
     while not stop.is_set():
         await asyncio.sleep(3600)
-        if store.get("mode", str) != "watch":
+        if store.get_global("mode", str) != "watch":
             continue
         now = int(time.time())
         if time.localtime(now).tm_hour != 10:
@@ -271,8 +357,8 @@ async def digest(session, stop):
             await tg.send(session, "За сутки под пороги никто не подошёл. "
                                    "Наблюдаю дальше.")
             continue
-        lines = [f"{r['symbol'] or '?'} · капа {money(r['mc'])} · "
-                 f"объём/мин {money(r['vol1m'])} · {r['fees_sol']:,.0f} SOL"
+        lines = [f"{r['symbol'] or '?'} ({r['chain']}) · капа {fmt.money(r['mc'])} · "
+                 f"объём/мин {fmt.money(r['vol1m'])} · комиссии {fmt.money(r['fees_usd'])}"
                  for r in rows[:15]]
         await tg.send(session,
             f"<b>Сводка за сутки: {len(rows)} находок</b>\n\n" + "\n".join(lines) +
@@ -282,11 +368,9 @@ async def digest(session, stop):
 async def main():
     store.init()
     stop = asyncio.Event()
-    log.info("старт, под наблюдением %s токенов", store.watch_size())
+    log.info("старт, сети: %s", ", ".join(store.enabled_chains()))
     async with aiohttp.ClientSession() as session:
         await asyncio.gather(
-            sources.pump_stream(stop),
-            gecko_loop(session, stop),
             scanner(session, stop),
             commands(session, stop),
             digest(session, stop),

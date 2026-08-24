@@ -7,6 +7,7 @@ on anyone's machine.
     TOKEN_ALERTS_HOME   directory with the files below, default ~/.token-alerts
     TG_BOT_TOKEN        or file  bot-token     — from @BotFather
     TG_OWNER_ID         or file  owner-id      — numeric chat id to notify
+    GMGN_API_KEY        or file  gmgn-api-key  — market data, required
     GROQ_API_KEY        or file  groq-key      — optional, enables summaries
 """
 
@@ -36,6 +37,10 @@ def owner_id():
         return int(raw)
     except ValueError:
         return 0
+
+
+def gmgn_key():
+    return _read("GMGN_API_KEY", "gmgn-api-key")
 
 
 def groq_key():
