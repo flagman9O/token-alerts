@@ -240,7 +240,7 @@ async def commands(session, stop):
 
 
 CHAIN_FIELDS = {"mc_min", "vol1m_min", "fees_min", "max_age_h"}
-GLOBAL_FIELDS = {"realert_h", "liq_min"}
+GLOBAL_FIELDS = {"realert_min", "liq_min"}
 
 
 async def reply(session, text):
@@ -256,7 +256,7 @@ async def reply(session, text):
             "/chains — какие сети включены; /chains sol off — выключить\n"
             "/mode watch|live — тихий режим или алерты\n"
             "/last — последние находки\n\n"
-            "В /set ключ — либо общий (realert_h, liq_min), либо сетевой "
+            "В /set ключ — либо общий (realert_min, liq_min), либо сетевой "
             "вида sol.mc_min. Комиссии через /set — только в долларах, "
             "валюту ввода меняйте в /settings.")
 
@@ -271,7 +271,7 @@ async def reply(session, text):
             f"<b>Режим:</b> {mode}",
             f"<b>Находок за сутки:</b> {len(day)}",
             f"<b>Ликвидность (все сети) ≥</b> {fmt.money(store.get_global('liq_min'))}",
-            f"<b>Повтор алерта:</b> не чаще {store.get_global('realert_h'):.0f} ч",
+            f"<b>Повтор алерта:</b> не чаще {store.get_global('realert_min'):.0f} мин",
             "",
         ]
         for chain in store.CHAINS:

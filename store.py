@@ -24,9 +24,9 @@ DB = Path(__file__).parent / "alerts.db"
 CHAINS = ("sol", "bsc", "base", "robinhood", "eth")
 
 GLOBAL_DEFAULTS = {
-    "mode": "watch",       # watch = collect quietly, live = send alerts
-    "realert_h": "6",      # do not repeat the same token more often
-    "liq_min": "0",        # liquidity floor, USD, off by default, all chains
+    "mode": "watch",         # watch = collect quietly, live = send alerts
+    "realert_min": "30",     # do not repeat the same token more often
+    "liq_min": "0",          # liquidity floor, USD, off by default, all chains
 }
 
 
@@ -188,6 +188,17 @@ def init():
                 conn.execute("DELETE FROM settings WHERE key = ?", (stale,))
             version = 3
 
+        # v3 -> v4: re-alert window switched from hours to minutes for
+        # 5/10/15/30/60-minute granularity. Unlike the fees_min unit change,
+        # this conversion needs no external rate and loses nothing, so the
+        # owner's actual value carries over instead of being reset.
+        if version < 4:
+            old_h = raw("realert_h")
+            if old_h is not None:
+                set_raw("realert_min", float(old_h) * 60)
+                conn.execute("DELETE FROM settings WHERE key = 'realert_h'")
+            version = 4
+
         set_raw("schema_version", str(version))
         for field, val in GLOBAL_DEFAULTS.items():
             conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?,?)",
@@ -267,7 +278,7 @@ def toggle_mode():
 # ---------- alerts ----------
 
 def recently_alerted(chain, address):
-    window = get_global("realert_h") * 3600
+    window = get_global("realert_min") * 60
     cutoff = time.time() - window
     with db() as conn:
         row = conn.execute(

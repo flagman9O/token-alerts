@@ -24,8 +24,8 @@ import telegram as tg
 CHIP_MC = (50_000, 100_000, 200_000, 500_000, 1_000_000)
 CHIP_VOL = (10_000, 25_000, 50_000, 75_000, 100_000)
 CHIP_AGE_H = (0, 6, 24, 72, 168)
-CHIP_REALERT_H = (1, 3, 6, 12, 24)
 CHIP_LIQ = (0, 10_000, 25_000, 50_000, 100_000)
+CHIP_REALERT_MIN = (5, 10, 15, 30, 60)
 CHIP_FEES_NATIVE = {"SOL": (5, 10, 25, 50, 100),
                     "BNB": (1, 2, 3, 5, 10),
                     "ETH": (0.25, 0.5, 1, 2, 5)}
@@ -33,17 +33,19 @@ CHIP_FEES_USD = (500, 1000, 2400, 5000, 10000)
 
 FIELD_LABELS = {
     "mc_min": "Капитализация", "vol1m_min": "Объём/мин",
-    "max_age_h": "Возраст", "realert_h": "Повтор алерта",
+    "max_age_h": "Возраст", "realert_min": "Повтор алерта",
     "liq_min": "Мин. ликвидность",
 }
 FIELD_ICONS = {
     "mc_min": "💰", "vol1m_min": "📈", "max_age_h": "⏳",
-    "realert_h": "⏱", "liq_min": "💧",
+    "realert_min": "⏱", "liq_min": "💧",
 }
 FIELD_EXAMPLES = {
     "mc_min": "300000", "vol1m_min": "75000",
-    "max_age_h": "48", "realert_h": "12", "liq_min": "20000",
+    "max_age_h": "48", "realert_min": "20", "liq_min": "20000",
 }
+# Unit shown in the custom-value prompt; anything not listed here is dollars.
+FIELD_UNITS = {"max_age_h": "часах", "realert_min": "минутах"}
 
 # The one place `PENDING` gets read or written outside this module is bot.py's
 # message loop, deciding whether the next text message is a menu answer.
@@ -65,8 +67,10 @@ def _grid(items, cols=3):
 def _chip_value(field, v):
     if field == "max_age_h":
         return fmt.hours(v)
-    if field in ("mc_min", "vol1m_min", "realert_h", "liq_min"):
-        return fmt.money(v) if field != "realert_h" else f"{v:.0f} ч"
+    if field == "realert_min":
+        return f"{v:.0f} мин"
+    if field in ("mc_min", "vol1m_min", "liq_min"):
+        return fmt.money(v)
     return str(v)
 
 
@@ -147,17 +151,17 @@ async def chain_screen(session, chain):
 
 async def global_screen(session):
     mode = store.get_global("mode", str)
-    realert = store.get_global("realert_h")
+    realert = store.get_global("realert_min")
     liq = store.get_global("liq_min")
     text = (
         "🌐 <b>Общие параметры</b>\n\n"
         f"Режим: {'🔴 live (алерты сразу)' if mode == 'live' else '🟡 watch (тихо, сводка раз в сутки)'}\n"
-        f"Повтор алерта: не чаще {realert:.0f} ч\n"
+        f"Повтор алерта: не чаще {realert:.0f} мин\n"
         f"Мин. ликвидность: {fmt.money(liq)} (все сети)"
     )
     rows = [
         [_btn(f"Режим: {'LIVE' if mode == 'live' else 'WATCH'}", "tgl:global:mode")],
-        [_btn(f"⏱ Повтор алерта: {realert:.0f} ч ▸", "edit:global:realert_h")],
+        [_btn(f"⏱ Повтор алерта: {realert:.0f} мин ▸", "edit:global:realert_min")],
         [_btn(f"💧 Мин. ликвидность: {fmt.money(liq)} ▸", "edit:global:liq_min")],
         [_btn("◀️ Назад", "root"), _btn("✖️ Закрыть", "close")],
     ]
@@ -166,7 +170,7 @@ async def global_screen(session):
 
 def chip_screen(scope, field, current):
     chips = {"mc_min": CHIP_MC, "vol1m_min": CHIP_VOL, "max_age_h": CHIP_AGE_H,
-             "realert_h": CHIP_REALERT_H, "liq_min": CHIP_LIQ}[field]
+             "realert_min": CHIP_REALERT_MIN, "liq_min": CHIP_LIQ}[field]
     buttons = [_btn(_chip_value(field, v), f"set:{scope}:{field}:{v}")
               for v in chips]
     rows = _grid(buttons, cols=3)
@@ -287,9 +291,7 @@ async def handle_callback(session, data, chat_id, message_id):
         _, scope, field = parts
         PENDING = {"scope": scope, "field": field, "chat_id": chat_id,
                    "message_id": message_id, "kind": "field"}
-        return custom_prompt(scope, field, " (в " +
-                             ("часах" if field == "max_age_h" else "долларах")
-                             + ")" if field != "realert_h" else " (в часах)")
+        return custom_prompt(scope, field, f" (в {FIELD_UNITS.get(field, 'долларах')})")
 
     if action == "customfee":
         _, chain = parts
