@@ -133,6 +133,21 @@ def init():
         conn.execute("CREATE INDEX IF NOT EXISTS alerts_token "
                      "ON alerts(chain, address)")
 
+        # `until` is a unix timestamp when the mute expires, or 0 for the
+        # "forever" choice — those are the ones that show up as "удалённые"
+        # in each chain's settings screen.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS mutes (
+                chain      TEXT NOT NULL,
+                address    TEXT NOT NULL,
+                symbol     TEXT DEFAULT '',
+                name       TEXT DEFAULT '',
+                until      INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (chain, address)
+            )
+        """)
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
@@ -289,7 +304,7 @@ def recently_alerted(chain, address):
 
 def save_alert(t, summary="", sent=0):
     with db() as conn:
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO alerts (chain, address, symbol, name, ts, mc, vol1m,"
             " liq, fees_native, fees_usd, age_h, holders, summary, sent)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -297,9 +312,80 @@ def save_alert(t, summary="", sent=0):
              t.get("name", ""), int(time.time()), t.get("mc"), t.get("vol1m"),
              t.get("liq"), t.get("fees_native"), t.get("fees_usd"),
              t.get("age_h"), t.get("holders"), summary, sent))
+        return cur.lastrowid
+
+
+def mark_sent(alert_id):
+    with db() as conn:
+        conn.execute("UPDATE alerts SET sent = 1 WHERE id = ?", (alert_id,))
+
+
+def alert_by_id(alert_id):
+    with db() as conn:
+        row = conn.execute("SELECT * FROM alerts WHERE id = ?",
+                           (alert_id,)).fetchone()
+    return dict(row) if row else None
 
 
 def alerts_since(ts):
     with db() as conn:
         return [dict(r) for r in conn.execute(
             "SELECT * FROM alerts WHERE ts >= ? ORDER BY ts DESC", (ts,))]
+
+
+# ---------- mutes ----------
+
+MUTE_DURATIONS = {"1h": 3600, "4h": 4 * 3600, "24h": 24 * 3600, "f": 0}
+MUTE_LABELS = {"1h": "на 1 час", "4h": "на 4 часа", "24h": "на 24 часа",
+              "f": "навсегда"}
+
+
+def mute_token(chain, address, symbol, name, duration):
+    now = int(time.time())
+    until = now + MUTE_DURATIONS[duration] if duration != "f" else 0
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO mutes (chain, address, symbol, name, until, created_at)"
+            " VALUES (?,?,?,?,?,?) ON CONFLICT(chain, address) DO UPDATE SET"
+            " until = excluded.until, symbol = excluded.symbol,"
+            " name = excluded.name, created_at = excluded.created_at",
+            (chain, address, symbol or "", name or "", until, now))
+
+
+def unmute_token(chain, address):
+    with db() as conn:
+        conn.execute("DELETE FROM mutes WHERE chain = ? AND address = ?",
+                     (chain, address))
+
+
+def is_muted(chain, address):
+    now = int(time.time())
+    with db() as conn:
+        row = conn.execute(
+            "SELECT until FROM mutes WHERE chain = ? AND address = ?",
+            (chain, address)).fetchone()
+        if not row:
+            return False
+        if row["until"] and row["until"] < now:
+            conn.execute("DELETE FROM mutes WHERE chain = ? AND address = ?",
+                         (chain, address))
+            return False
+        return True
+
+
+def muted_list(chain):
+    """Only the "forever" mutes — the ones the owner actually wants to manage
+    from the settings menu. Timed mutes expire on their own and never
+    accumulate anywhere that needs cleaning up by hand."""
+    with db() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM mutes WHERE chain = ? AND until = 0"
+            " ORDER BY created_at DESC", (chain,))]
+
+
+def muted_count(chain):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM mutes WHERE chain = ? AND until = 0",
+            (chain,)).fetchone()
+    return row["n"]

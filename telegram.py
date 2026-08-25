@@ -75,6 +75,31 @@ async def edit_message(session, chat_id, message_id, text, reply_markup=None):
         return False
 
 
+async def edit_markup(session, chat_id, message_id, reply_markup=None):
+    """Swaps the buttons under an already-sent message without touching its
+    text — used after a mute button is pressed, so the alert card itself
+    stays intact and only the row of buttons changes."""
+    tok = _token()
+    if not tok:
+        return False
+    payload = {"chat_id": chat_id, "message_id": message_id,
+               "reply_markup": reply_markup or {"inline_keyboard": []}}
+    try:
+        async with session.post(
+                API.format(tok, "editMessageReplyMarkup"), json=payload,
+                timeout=aiohttp.ClientTimeout(total=25)) as r:
+            d = await r.json(content_type=None)
+            if not d.get("ok"):
+                desc = d.get("description") or ""
+                if "not modified" not in desc:
+                    log.warning("telegram edit_markup: %s", desc)
+                return False
+            return True
+    except Exception as e:
+        log.warning("telegram edit_markup: %s", type(e).__name__)
+        return False
+
+
 async def answer_callback(session, callback_query_id, text=None, show_alert=False):
     """Must be called for every button press, or the client shows a spinner
     until Telegram times it out on its own."""

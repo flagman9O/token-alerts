@@ -144,8 +144,26 @@ async def chain_screen(session, chain):
         [_btn(f"{'🟢' if cfg['risk_filter'] else '⛔'} Риск-фильтр",
               f"tgl:{chain}:risk_filter")],
         [_btn("🔍 Проверить сейчас", f"scan:{chain}")],
+        [_btn(f"🗑 Удалённые ({store.muted_count(chain)})", f"removed:{chain}")],
         [_btn("◀️ Назад", "root"), _btn("✖️ Закрыть", "close")],
     ]
+    return text, _kb(rows)
+
+
+async def removed_screen(session, chain):
+    muted = store.muted_list(chain)
+    text = f"🗑 <b>{gmgn.CHAIN_NAMES[chain]} → Удалённые токены</b>\n\n"
+    text += ("Токены, замьюченные навсегда кнопкой «навсегда» на алерте — "
+             "по ним больше не будет алертов, пока не вернуть отсюда.\n\n"
+             if muted else "Пусто — навсегда замьюченных токенов нет.")
+
+    rows = []
+    for m in muted[:30]:
+        addr = m["address"]
+        short = f"{addr[:6]}…{addr[-4:]}" if len(addr) > 12 else addr
+        label = f"{m['symbol'] or '?'} · {short}"
+        rows.append([_btn(f"♻️ {label}", f"unmute:{chain}:{addr}")])
+    rows.append([_btn("◀️ Назад", f"chain:{chain}")])
     return text, _kb(rows)
 
 
@@ -247,6 +265,14 @@ async def handle_callback(session, data, chat_id, message_id):
         return root_screen()
     if action == "chain":
         return await chain_screen(session, parts[1])
+
+    if action == "removed":
+        return await removed_screen(session, parts[1])
+
+    if action == "unmute":
+        _, chain, address = parts
+        store.unmute_token(chain, address)
+        return await removed_screen(session, chain)
 
     if action == "tgl":
         _, scope, field = parts

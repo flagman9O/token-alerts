@@ -36,7 +36,8 @@ log = logging.getLogger("bot")
 SCAN_EVERY = 30          # seconds between passes
 
 # Bubblemaps has its own chain slugs and does not cover every network.
-BUBBLE = {"sol": "solana", "bsc": "bsc", "base": "base", "eth": "eth"}
+BUBBLE = {"sol": "solana", "bsc": "bsc", "base": "base", "eth": "eth",
+         "robinhood": "robinhood"}
 
 
 # ---------- formatting ----------
@@ -137,6 +138,8 @@ async def scan_chain(session, chain, cfg, prices):
             continue
         if store.recently_alerted(chain, t["address"]):
             continue
+        if store.is_muted(chain, t["address"]):
+            continue
 
         info = await gmgn.token_info(session, chain, t["address"])
         if not info:
@@ -159,16 +162,28 @@ async def scan_chain(session, chain, cfg, prices):
     return hits
 
 
+MUTE_BUTTONS = (("1h", "1ч"), ("4h", "4ч"), ("24h", "24ч"), ("f", "навсегда"))
+
+
+def mute_kb(alert_id):
+    return {"inline_keyboard": [[
+        {"text": f"🔇 {label}", "callback_data": f"mute:{alert_id}:{code}"}
+        for code, label in MUTE_BUTTONS
+    ]]}
+
+
 async def handle_hit(session, hit, live):
     text = ""
     if hit.get("summary_enabled", True):
         text = await summary.describe(session, hit.get("name"), hit.get("symbol"),
                                       hit.get("description", ""),
                                       gmgn.twitter_url(hit.get("twitter")))
+    alert_id = store.save_alert(hit, summary=text, sent=0)
     sent = 0
     if live:
-        sent = 1 if await tg.send(session, card(hit, text)) else 0
-    store.save_alert(hit, summary=text, sent=sent)
+        if await tg.send(session, card(hit, text), reply_markup=mute_kb(alert_id)):
+            sent = 1
+            store.mark_sent(alert_id)
     log.info("находка: %s/%s mc=%.0f vol1m=%.0f комиссии=$%.0f%s",
              hit["chain"], hit.get("symbol"), hit.get("mc"), hit.get("vol1m"),
              hit.get("fees_usd"), "" if live else " (тихий режим)")
@@ -205,16 +220,38 @@ async def scanner(session, stop):
         await asyncio.sleep(max(5, SCAN_EVERY - (time.time() - started)))
 
 
+async def handle_mute(session, alert_id, code, chat_id, message_id, cq_id):
+    row = store.alert_by_id(alert_id)
+    if not row:
+        await tg.answer_callback(session, cq_id, "Алерт устарел", show_alert=True)
+        return
+    store.mute_token(row["chain"], row["address"], row["symbol"], row["name"], code)
+    label = store.MUTE_LABELS[code]
+    button = {"text": f"🔇 Заглушено: {label}", "callback_data": "noop"}
+    await tg.edit_markup(session, chat_id, message_id, {"inline_keyboard": [[button]]})
+    extra = (" Токен в списке «Удалённые» в /settings этой сети."
+             if code == "f" else "")
+    await tg.answer_callback(session, cq_id, f"Алерты по этому токену заглушены "
+                             f"{label}.{extra}", show_alert=True)
+
+
 async def handle_button(session, data, chat_id, message_id, cq_id):
     try:
-        if data.startswith("scan:"):
+        if data == "noop":
+            await tg.answer_callback(session, cq_id)
+        elif data.startswith("scan:"):
             chain = data.split(":", 1)[1]
             await manual_scan(session, chain)
             text, kb = await menu.chain_screen(session, chain)
+            await tg.edit_message(session, chat_id, message_id, text, kb)
+            await tg.answer_callback(session, cq_id)
+        elif data.startswith("mute:"):
+            _, alert_id, code = data.split(":")
+            await handle_mute(session, int(alert_id), code, chat_id, message_id, cq_id)
         else:
             text, kb = await menu.handle_callback(session, data, chat_id, message_id)
-        await tg.edit_message(session, chat_id, message_id, text, kb)
-        await tg.answer_callback(session, cq_id)
+            await tg.edit_message(session, chat_id, message_id, text, kb)
+            await tg.answer_callback(session, cq_id)
     except Exception as e:
         log.exception("меню: %s", e)
         await tg.answer_callback(session, cq_id, "Ошибка, попробуйте ещё раз",
