@@ -11,6 +11,7 @@ lifetime fees across every pool — the same number gmgn shows as "Total Fees".
 """
 
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -108,7 +109,16 @@ async def _get(session, path, params):
                 f"{HOST}{path}", params=query,
                 headers={"X-APIKEY": key, "User-Agent": UA},
                 timeout=aiohttp.ClientTimeout(total=25)) as r:
-            body = await r.json(content_type=None)
+            raw = await r.text()
+            try:
+                body = json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                # Not GMGN talking — a proxy/WAF (Cloudflare's JS challenge is
+                # the one actually seen) answered instead. The snippet is what
+                # tells the two apart from the log, no manual curl needed.
+                log.warning("gmgn %s: не-JSON ответ (HTTP %s): %s", path,
+                            r.status, raw[:200].replace("\n", " "))
+                return None
             if r.status == 429:
                 reset = _num((body or {}).get("reset_at"))
                 wait = max(10.0, reset - time.time()) if reset else 60.0
