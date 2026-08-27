@@ -44,8 +44,9 @@ Binance — так одно число работает одинаково на 
 ## Установка
 
 ```bash
-git clone https://github.com/USERNAME/token-alerts.git
+git clone https://github.com/flagman9O/token-alerts.git
 cd token-alerts
+sudo apt install -y python3-venv   # на части Debian/Ubuntu venv — отдельный пакет
 ./install.sh
 ```
 
