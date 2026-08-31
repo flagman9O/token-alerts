@@ -71,7 +71,8 @@ def card(t, text=""):
     body = [
         head, "",
         f"Капитализация   <b>{fmt.money(t.get('mc'))}</b>",
-        f"Объём за 1 мин  <b>{fmt.money(t.get('vol1m'))}</b>",
+        f"Объём за {store.VOL_INTERVAL_LABELS.get(t.get('interval'), '1 мин')}  "
+        f"<b>{fmt.money(t.get('vol1m'))}</b>",
         f"Комиссии всего  <b>{t.get('fees_native', 0):,.1f} {coin}</b>"
         f" ({fmt.money(t.get('fees_usd'))})",
         f"Ликвидность     {fmt.money(t.get('liq'))}",
@@ -123,8 +124,8 @@ async def scan_chain(session, chain, cfg, prices):
     disabled one too, since that is exactly what "проверить сейчас" needs to
     preview a chain before switching it on.
     """
-    rows = await gmgn.rank(session, chain,
-                           mc_min=cfg["mc_min"], vol_min=cfg["vol1m_min"])
+    rows = await gmgn.rank(session, chain, mc_min=cfg["mc_min"],
+                           vol_min=cfg["vol1m_min"], interval=cfg["vol_interval"])
     liq_min = store.get_global("liq_min")
     hits = []
     for t in rows:
@@ -317,7 +318,7 @@ async def reply(session, text):
             lines.append(
                 f"{mark} <b>{gmgn.CHAIN_NAMES[chain]}</b>: "
                 f"капа≥{fmt.money(c['mc_min'])} · "
-                f"объём/мин≥{fmt.money(c['vol1m_min'])} · "
+                f"объём/{store.VOL_INTERVAL_LABELS[c['vol_interval']]}≥{fmt.money(c['vol1m_min'])} · "
                 f"комиссии≥{fmt.money(c['fees_min'])} · "
                 f"возраст≤{fmt.hours(c['max_age_h'])}")
         await tg.send(session, "\n".join(lines))

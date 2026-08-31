@@ -166,6 +166,7 @@ async def rank(session, chain, *, mc_min=0, vol_min=0, interval="1m", limit=100)
             "symbol": t.get("symbol") or "",
             "name": t.get("name") or "",
             "mc": _num(t.get("market_cap")),
+            "interval": interval,
             "vol1m": _num(t.get("volume")),
             "liq": _num(t.get("liquidity")),
             "created": int(_num(t.get("creation_timestamp"))),

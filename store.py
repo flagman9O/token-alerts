@@ -23,6 +23,9 @@ DB = Path(__file__).parent / "alerts.db"
 
 CHAINS = ("sol", "bsc", "base", "robinhood", "eth")
 
+VOL_INTERVALS = ("1m", "5m")
+VOL_INTERVAL_LABELS = {"1m": "1 мин", "5m": "5 мин"}
+
 GLOBAL_DEFAULTS = {
     "mode": "watch",         # watch = collect quietly, live = send alerts
     "realert_min": "30",     # do not repeat the same token more often
@@ -37,7 +40,8 @@ def chain_defaults(chain):
         # but off until asked for.
         "enabled": "1" if chain in ("sol", "bsc", "base", "robinhood") else "0",
         "mc_min": "200000",         # market cap, USD
-        "vol1m_min": "50000",       # volume over the last minute, USD
+        "vol1m_min": "50000",       # volume threshold, USD
+        "vol_interval": "1m",       # which window vol1m_min is measured over
         "fees_min": "2400",         # lifetime fees, USD — about 25 SOL
         "fees_currency": "native",  # which unit /settings shows and accepts
         "max_age_h": "0",           # token age cap in hours; 0 = no limit
@@ -214,6 +218,14 @@ def init():
                 conn.execute("DELETE FROM settings WHERE key = 'realert_h'")
             version = 4
 
+        # v4 -> v5: volume threshold gets a per-chain choice of window (1m or
+        # 5m) instead of always meaning the last minute.
+        if version < 5:
+            for chain in CHAINS:
+                if raw(f"{chain}.vol_interval") is None:
+                    set_raw(f"{chain}.vol_interval", "1m")
+            version = 5
+
         set_raw("schema_version", str(version))
         for field, val in GLOBAL_DEFAULTS.items():
             conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?,?)",
@@ -250,11 +262,18 @@ def toggle_chain(chain, field):
     return new
 
 
+def toggle_vol_interval(chain):
+    new = "5m" if get_chain(chain, "vol_interval", str) == "1m" else "1m"
+    put_chain(chain, "vol_interval", new)
+    return new
+
+
 def chain_config(chain):
     return {
         "enabled": get_chain(chain, "enabled", bool),
         "mc_min": get_chain(chain, "mc_min", float),
         "vol1m_min": get_chain(chain, "vol1m_min", float),
+        "vol_interval": get_chain(chain, "vol_interval", str),
         "fees_min": get_chain(chain, "fees_min", float),
         "fees_currency": get_chain(chain, "fees_currency", str),
         "max_age_h": get_chain(chain, "max_age_h", float),

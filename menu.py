@@ -119,11 +119,12 @@ async def chain_screen(session, chain):
                 if cfg["fees_currency"] == "native"
                 else f"{fmt.money(cfg['fees_min'])} (≈ {native:,.2f} {coin})")
 
+    vol_label = store.VOL_INTERVAL_LABELS[cfg["vol_interval"]]
     text = (
         f"⚙️ <b>{gmgn.CHAIN_NAMES[chain]}</b>\n\n"
         f"Алерты: {'🟢 включены' if cfg['enabled'] else '⛔ выключены'}\n"
         f"Капитализация ≥ {fmt.money(cfg['mc_min'])}\n"
-        f"Объём/мин ≥ {fmt.money(cfg['vol1m_min'])}\n"
+        f"Объём/{vol_label} ≥ {fmt.money(cfg['vol1m_min'])}\n"
         f"Комиссии ≥ {fee_line}\n"
         f"Возраст ≤ {fmt.hours(cfg['max_age_h'])}\n"
         f"Сводка о токене: {'🟢 включена' if cfg['summary'] else '⛔ выключена'}\n"
@@ -134,8 +135,10 @@ async def chain_screen(session, chain):
               f"tgl:{chain}:enabled")],
         [_btn(f"💰 Капитализация: {fmt.money(cfg['mc_min'])} ▸",
               f"edit:{chain}:mc_min")],
-        [_btn(f"📈 Объём/мин: {fmt.money(cfg['vol1m_min'])} ▸",
+        [_btn(f"📈 Объём/{vol_label}: {fmt.money(cfg['vol1m_min'])} ▸",
               f"edit:{chain}:vol1m_min")],
+        [_btn(f"🕐 Интервал: {'●1м ○5м' if cfg['vol_interval'] == '1m' else '○1м ●5м'}",
+              f"volint:{chain}")],
         [_btn("💵 Комиссии ▸", f"edit:{chain}:fees_min")],
         [_btn(f"⏳ Возраст: {fmt.hours(cfg['max_age_h'])} ▸",
               f"edit:{chain}:max_age_h")],
@@ -195,7 +198,10 @@ def chip_screen(scope, field, current):
     rows.append([_btn("✏️ Своё значение", f"custom:{scope}:{field}")])
     rows.append([_btn("◀️ Назад", _parent_action(scope))])
 
-    text = (f"{FIELD_ICONS[field]} <b>{_scope_name(scope)} → {FIELD_LABELS[field]}</b>\n\n"
+    label = FIELD_LABELS[field]
+    if field == "vol1m_min" and scope != "global":
+        label = f"Объём/{store.VOL_INTERVAL_LABELS[store.get_chain(scope, 'vol_interval', str)]}"
+    text = (f"{FIELD_ICONS[field]} <b>{_scope_name(scope)} → {label}</b>\n\n"
             f"Сейчас: {_chip_value(field, current)}")
     return text, _kb(rows)
 
@@ -281,6 +287,11 @@ async def handle_callback(session, data, chat_id, message_id):
             return await global_screen(session)
         store.toggle_chain(scope, field)
         return await chain_screen(session, scope)
+
+    if action == "volint":
+        _, chain = parts
+        store.toggle_vol_interval(chain)
+        return await chain_screen(session, chain)
 
     if action == "edit":
         _, scope, field = parts
